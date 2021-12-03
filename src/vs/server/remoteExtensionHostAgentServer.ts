@@ -33,7 +33,7 @@ import { ConfigurationService } from 'vs/platform/configuration/common/configura
 import { IConfigurationService } from 'vs/platform/configuration/common/configuration';
 import { IRequestService } from 'vs/platform/request/common/request';
 import { RequestService } from 'vs/platform/request/node/requestService';
-import { ITelemetryAppender, NullAppender } from 'vs/platform/telemetry/common/telemetryUtils';
+import { ITelemetryAppender, NullAppender, supportsTelemetry } from 'vs/platform/telemetry/common/telemetryUtils';
 import { ITelemetryService } from 'vs/platform/telemetry/common/telemetry';
 import { IExtensionGalleryService, IExtensionManagementCLIService, IExtensionManagementService } from 'vs/platform/extensionManagement/common/extensionManagement';
 import { ExtensionGalleryServiceWithNoStorageService } from 'vs/platform/extensionManagement/common/extensionGalleryService';
@@ -77,6 +77,8 @@ import { SpdLogLogger } from 'vs/platform/log/node/spdlogLog';
 import { IPtyService, TerminalSettingId } from 'vs/platform/terminal/common/terminal';
 import { PtyHostService } from 'vs/platform/terminal/node/ptyHostService';
 import { IRemoteTelemetryService, RemoteNullTelemetryService, RemoteTelemetryService } from 'vs/server/remoteTelemetryService';
+import { IUriIdentityService } from 'vs/platform/uriIdentity/common/uriIdentity';
+import { UriIdentityService } from 'vs/platform/uriIdentity/common/uriIdentityService';
 
 const SHUTDOWN_TIMEOUT = 5 * 60 * 1000;
 
@@ -229,7 +231,7 @@ export class RemoteExtensionHostAgentServer extends Disposable {
 		const logService = getOrCreateSpdLogService(this._environmentService);
 		logService.trace(`Remote configuration data at ${REMOTE_DATA_FOLDER}`);
 		logService.trace('process arguments:', this._environmentService.args);
-		const serverGreeting = product.serverGreeting.join('\n');
+		const serverGreeting = _productService.serverGreeting.join('\n');
 		if (serverGreeting) {
 			logService.info(`\n\n${serverGreeting}\n\n`);
 		}
@@ -242,7 +244,7 @@ export class RemoteExtensionHostAgentServer extends Disposable {
 		this._allReconnectionTokens = new Set<string>();
 
 		if (hasWebClient) {
-			this._webClientServer = new WebClientServer(this._connectionToken, this._environmentService, this._logService);
+			this._webClientServer = new WebClientServer(this._connectionToken, this._environmentService, this._logService, this._productService);
 		} else {
 			this._webClientServer = null;
 		}
@@ -278,19 +280,24 @@ export class RemoteExtensionHostAgentServer extends Disposable {
 
 		const configurationService = new ConfigurationService(this._environmentService.machineSettingsResource, fileService);
 		services.set(IConfigurationService, configurationService);
+
+		// URI Identity
+		services.set(IUriIdentityService, new UriIdentityService(fileService));
+
+		// Request
 		services.set(IRequestService, new SyncDescriptor(RequestService));
 
 		let appInsightsAppender: ITelemetryAppender = NullAppender;
-		if (!this._environmentService.args['disable-telemetry'] && product.enableTelemetry) {
-			if (product.aiConfig && product.aiConfig.asimovKey) {
-				appInsightsAppender = new AppInsightsAppender(eventPrefix, null, product.aiConfig.asimovKey);
+		if (supportsTelemetry(this._productService, this._environmentService)) {
+			if (this._productService.aiConfig && this._productService.aiConfig.asimovKey) {
+				appInsightsAppender = new AppInsightsAppender(eventPrefix, null, this._productService.aiConfig.asimovKey);
 				this._register(toDisposable(() => appInsightsAppender!.flush())); // Ensure the AI appender is disposed so that it flushes remaining data
 			}
 
 			const machineId = await getMachineId();
 			const config: ITelemetryServiceConfig = {
 				appenders: [appInsightsAppender],
-				commonProperties: resolveCommonProperties(fileService, release(), hostname(), process.arch, product.commit, product.version + '-remote', machineId, product.msftInternalDomains, this._environmentService.installSourcePath, 'remoteAgent'),
+				commonProperties: resolveCommonProperties(fileService, release(), hostname(), process.arch, this._productService.commit, this._productService.version + '-remote', machineId, this._productService.msftInternalDomains, this._environmentService.installSourcePath, 'remoteAgent'),
 				piiPaths: [this._environmentService.appRoot]
 			};
 
@@ -315,18 +322,18 @@ export class RemoteExtensionHostAgentServer extends Disposable {
 		const ptyService = instantiationService.createInstance(
 			PtyHostService,
 			{
-				GraceTime: ProtocolConstants.ReconnectionGraceTime,
-				ShortGraceTime: ProtocolConstants.ReconnectionShortGraceTime,
+				graceTime: ProtocolConstants.ReconnectionGraceTime,
+				shortGraceTime: ProtocolConstants.ReconnectionShortGraceTime,
 				scrollback: configurationService.getValue<number>(TerminalSettingId.PersistentSessionScrollback) ?? 100
 			}
 		);
 		services.set(IPtyService, ptyService);
 
 		return instantiationService.invokeFunction(accessor => {
-			const remoteExtensionEnvironmentChannel = new RemoteAgentEnvironmentChannel(this._connectionToken, this._environmentService, extensionManagementCLIService, this._logService, accessor.get(IRemoteTelemetryService), appInsightsAppender);
+			const remoteExtensionEnvironmentChannel = new RemoteAgentEnvironmentChannel(this._connectionToken, this._environmentService, extensionManagementCLIService, this._logService, accessor.get(IRemoteTelemetryService), appInsightsAppender, this._productService);
 			this._socketServer.registerChannel('remoteextensionsenvironment', remoteExtensionEnvironmentChannel);
 
-			this._socketServer.registerChannel(REMOTE_TERMINAL_CHANNEL_NAME, new RemoteTerminalChannel(this._environmentService, this._logService, ptyService));
+			this._socketServer.registerChannel(REMOTE_TERMINAL_CHANNEL_NAME, new RemoteTerminalChannel(this._environmentService, this._logService, ptyService, this._productService));
 
 			const remoteFileSystemChannel = new RemoteAgentFileSystemProviderChannel(this._logService, this._environmentService);
 			this._socketServer.registerChannel(REMOTE_FILE_SYSTEM_CHANNEL_NAME, remoteFileSystemChannel);
@@ -339,6 +346,9 @@ export class RemoteExtensionHostAgentServer extends Disposable {
 
 			// clean up deprecated extensions
 			(extensionManagementService as ExtensionManagementService).removeDeprecatedExtensions();
+
+			// migrate unsupported extensions
+			(extensionManagementService as ExtensionManagementService).migrateUnsupportedExtensions();
 
 			this._register(new ErrorTelemetry(accessor.get(ITelemetryService)));
 
@@ -375,7 +385,7 @@ export class RemoteExtensionHostAgentServer extends Disposable {
 		// Version
 		if (pathname === '/version') {
 			res.writeHead(200, { 'Content-Type': 'text/plain' });
-			return res.end(product.commit || '');
+			return res.end(this._productService.commit || '');
 		}
 
 		// Delay shutdown
@@ -487,12 +497,14 @@ export class RemoteExtensionHostAgentServer extends Disposable {
 
 		// Never timeout this socket due to inactivity!
 		socket.setTimeout(0);
+		// Disable Nagle's algorithm
+		socket.setNoDelay(true);
 		// Finally!
 
 		if (skipWebSocketFrames) {
-			this._handleWebSocketConnection(new NodeSocket(socket), isReconnection, reconnectionToken);
+			this._handleWebSocketConnection(new NodeSocket(socket, `server-connection-${reconnectionToken}`), isReconnection, reconnectionToken);
 		} else {
-			this._handleWebSocketConnection(new WebSocketNodeSocket(new NodeSocket(socket), permessageDeflate, null, true), isReconnection, reconnectionToken);
+			this._handleWebSocketConnection(new WebSocketNodeSocket(new NodeSocket(socket, `server-connection-${reconnectionToken}`), permessageDeflate, null, true), isReconnection, reconnectionToken);
 		}
 	}
 
@@ -628,7 +640,7 @@ export class RemoteExtensionHostAgentServer extends Disposable {
 				}
 
 				const rendererCommit = msg2.commit;
-				const myCommit = product.commit;
+				const myCommit = this._productService.commit;
 				if (rendererCommit && myCommit) {
 					// Running in the built version where commits are defined
 					if (rendererCommit !== myCommit) {
@@ -747,6 +759,7 @@ export class RemoteExtensionHostAgentServer extends Disposable {
 					}
 				}
 
+				protocol.sendPause();
 				protocol.sendControl(VSBuffer.fromString(JSON.stringify(startParams.port ? { debugPort: startParams.port } : {})));
 				const dataChunk = protocol.readEntireBuffer();
 				protocol.dispose();
@@ -759,6 +772,7 @@ export class RemoteExtensionHostAgentServer extends Disposable {
 					return this._rejectWebSocketConnection(logPrefix, protocol, `Duplicate reconnection token`);
 				}
 
+				protocol.sendPause();
 				protocol.sendControl(VSBuffer.fromString(JSON.stringify(startParams.port ? { debugPort: startParams.port } : {})));
 				const dataChunk = protocol.readEntireBuffer();
 				protocol.dispose();
@@ -907,8 +921,8 @@ export class RemoteExtensionHostAgentServer extends Disposable {
 
 function parseConnectionToken(args: ServerParsedArgs): { connectionToken: string; connectionTokenIsMandatory: boolean; } {
 	if (args['connection-secret']) {
-		if (args['connectionToken']) {
-			console.warn(`Please do not use the argument connectionToken at the same time as connection-secret.`);
+		if (args['connection-token']) {
+			console.warn(`Please do not use the argument '--connection-token' at the same time as '--connection-secret'.`);
 			process.exit(1);
 		}
 		let rawConnectionToken = fs.readFileSync(args['connection-secret']).toString();
@@ -919,7 +933,7 @@ function parseConnectionToken(args: ServerParsedArgs): { connectionToken: string
 		}
 		return { connectionToken: rawConnectionToken, connectionTokenIsMandatory: true };
 	} else {
-		return { connectionToken: args['connectionToken'] || generateUuid(), connectionTokenIsMandatory: false };
+		return { connectionToken: args['connection-token'] || generateUuid(), connectionTokenIsMandatory: false };
 	}
 }
 
@@ -1036,7 +1050,7 @@ const getOrCreateSpdLogService: (environmentService: IServerEnvironmentService) 
 	let _logService: ILogService | null;
 	return function getLogService(environmentService: IServerEnvironmentService): ILogService {
 		if (!_logService) {
-			_logService = new LogService(new SpdLogLogger(RemoteExtensionLogFileName, join(environmentService.logsPath, `${RemoteExtensionLogFileName}.log`), true, getLogLevel(environmentService)));
+			_logService = new LogService(new SpdLogLogger(RemoteExtensionLogFileName, join(environmentService.logsPath, `${RemoteExtensionLogFileName}.log`), true, false, getLogLevel(environmentService)));
 		}
 		return _logService;
 	};
