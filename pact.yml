@@ -1,0 +1,12 @@
+const  tar  =  ต้อง ( 'tar' ) 
+
+tarน้ำมันดิน x ( { 
+  file : 'archive.tgz' , 
+  filter : ( file ,  รายการ )  =>  { 
+    if  ( รายการ . type  ===  'SymbolicLink' )  { 
+      return  false 
+    }  else  { 
+      return  true 
+    } 
+  } 
+} ) 
